@@ -1,0 +1,5 @@
+# GCP用の環境変数ファイル（もし使うなら）
+.env
+
+# dependencies
+/node_modules
