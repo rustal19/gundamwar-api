@@ -232,6 +232,39 @@ function addStatRangeCondition(field1, field2, alt1, alt2, min, max, includeAltS
   return { condition: conditions.join(' '), params };
 }
 
+
+//国力関連の処理
+function addCostRangeCondition(field, min, max, includeUndecided) {
+  const conditions = [];
+  const params = [];
+  
+  // 入力が空文字またはundefinedの場合は「指定なし」とみなす
+  const isMinSpecified = (min !== "" && min !== undefined);
+  const isMaxSpecified = (max !== "" && max !== undefined);
+
+  if (isMinSpecified && isMaxSpecified) {
+    // 数字 ≦ 条件 ≦ 数字 → BETWEEN で範囲指定
+    conditions.push(`(${field} BETWEEN ? AND ?)`);
+    params.push(min, max);
+  } else if (isMinSpecified) {
+    // 数字 ≦ 条件 ≦ 指定なし → stat が min 以上
+    conditions.push(`(${field} >= ?)`);
+    params.push(min);
+  } else if (isMaxSpecified) {
+    // 指定なし ≦ 条件 ≦ 数字 → stat が max 以下
+    conditions.push(`(${field} <= ?)`);
+    params.push(max);
+  }
+
+  // includeUndecided がチェックされている場合、数字以外を含む条件を追加
+  if (includeUndecided) {
+    conditions.push(`(${field} NOT REGEXP '^[0-9]+$')`);
+  }
+
+  return { condition: conditions.join(' '), params };
+}
+
+
 function extractSetInclusion(row) {
   const includedSets = [];
   for (const code in setLabels) {
@@ -263,6 +296,40 @@ function extractTraits2(rows) {
     map[row.cardId].add(row.traitsName);
   }
   return map;
+}
+
+// exclusivePilots  の抽出（JOIN結果からセットにまとめる）
+function extractexClusivePilots(rows) {
+  const map1 = {};
+  for (const row of rows) {
+    if (!row.cardId || !row.exclusivePilots) continue;
+    if (!map1[row.cardId]) map1[row.cardId] = new Set();
+    map1[row.cardId].add(row.exclusivePilots);
+  }
+  
+  // セットを配列に戻す
+  for (const cardId in map1) {
+    map1[cardId] = Array.from(map1[cardId]);
+  }
+  
+  return map1;
+}
+
+// aliases の抽出（JOIN結果からセットにまとめる）
+function extractAliases(rows) {
+  const map2 = {};
+  for (const row of rows) {
+    if (!row.cardId || !row.aliases) continue;
+    if (!map2[row.cardId]) map2[row.cardId] = new Set();
+    map2[row.cardId].add(row.aliases);
+  }
+  
+  // セットを配列に戻す
+  for (const cardId in map2) {
+    map2[cardId] = Array.from(map2[cardId]);
+  }
+  
+  return map2;
 }
 
 // card_text のマージ処理
@@ -346,10 +413,18 @@ function formatCardResults(results) {
 app.post('/api/search', (req, res) => {
   const { 
     name, 
+    name_forward,
     cardType, 
     colorInclude, 
     colorExclude, 
     colorMulti, 
+    spCostMin,
+    spCostMax,
+    totalCostMin,
+    totalCostMax,
+    resourceCostMin,
+    resourceCostMax,
+    includeUndecided,
     text, 
     fightMin,
     fightMax,
@@ -366,6 +441,7 @@ app.post('/api/search', (req, res) => {
     otherFeature,
     traits_logic,
     traitText,
+    exclusivePilotText,
     setIncluded,
     setFeatureExtraBB,
     setFeatureExtraST,
@@ -382,8 +458,13 @@ app.post('/api/search', (req, res) => {
 
   // カード名検索
   if (name) {
-    conditions.push(`cd.name LIKE ?`);
-    params.push(`%${name}%`);
+    if(name_forward){
+      conditions.push(`cd.name LIKE ?`);
+      params.push(`${name}%`);
+    } else {
+      conditions.push(`cd.name LIKE ?`);
+      params.push(`%${name}%`);
+    }
   }
 
   // カードタイプ検索
@@ -431,6 +512,26 @@ app.post('/api/search', (req, res) => {
       params.push(`%${keyword}%`);
     });
   }
+// spPowerCost1, spPowerCost2 に対する条件
+const spPowerCostCond = addCostRangeCondition('cd.spPowerCost1', spCostMin, spCostMax, includeUndecided);
+if (spPowerCostCond.condition) {
+  conditions.push(spPowerCostCond.condition);
+  params.push(...spPowerCostCond.params);
+}
+
+// totalCost に対する条件
+const totalCostCond = addCostRangeCondition('cd.totalCost', totalCostMin, totalCostMax, includeUndecided);
+if (totalCostCond.condition) {
+  conditions.push(totalCostCond.condition);
+  params.push(...totalCostCond.params);
+}
+
+// resourceCost に対する条件
+const resourceCostCond = addCostRangeCondition('cd.resourceCost', resourceCostMin, resourceCostMax, includeUndecided);
+if (resourceCostCond.condition) {
+  conditions.push(resourceCostCond.condition);
+  params.push(...resourceCostCond.params);
+}
 
   // 格闘、射撃、防御条件
   const meleeCond = addStatRangeCondition('cd.melee1', 'cd.melee2', 'cd.altMelee1', 'cd.altMelee2', fightMin, fightMax, includeAltStats);
@@ -476,6 +577,17 @@ app.post('/api/search', (req, res) => {
     conditions.push(`(${keywordConds.join(keywordJoiner)})`);
     params.push(...keywords.map(k => `%${k}%`));
   }
+
+  // 専用パイロット検索
+  if (typeof exclusivePilotText === 'string' && exclusivePilotText.trim() !== "") {
+    const keywords = exclusivePilotText.trim().split(/\s+/);
+    const keywordConds = keywords.map(kw => `EXISTS (SELECT 1 FROM exclusive_pilots ep WHERE ep.cardId = cd.cardId AND ep.exclusivePilots  LIKE ?)`);
+    // デフォルトは AND 検索
+    const keywordJoiner = ' AND ';
+    conditions.push(`(${keywordConds.join(keywordJoiner)})`);
+    params.push(...keywords.map(k => `%${k}%`));
+  }
+
   // 収録弾フィルタ（card_set_inclusionテーブル）
   const allSetValues = [
     ...(setIncluded || []),
@@ -581,7 +693,9 @@ pool.query(idQuery, idQueryParams, (err, idResults) => {
       ts.space,
       ts.earth,
       t2.traitsName AS t2_traitsName,
-      si.*
+      si.*,
+      ca.aliases,
+      ep.exclusivePilots
     FROM card_data cd
     LEFT JOIN card_type_list ctd ON cd.cardType = ctd.cardTypeId
     LEFT JOIN card_type_list actd ON cd.altCardType = actd.cardTypeId
@@ -590,6 +704,8 @@ pool.query(idQuery, idQueryParams, (err, idResults) => {
     LEFT JOIN card_text ct ON cd.cardId = ct.cardId
     LEFT JOIN terrain_suitability ts ON cd.cardId = ts.cardId
     LEFT JOIN traits2 t2 ON cd.cardId = t2.cardId
+    LEFT JOIN card_aliases ca ON cd.cardId = ca.cardId
+    LEFT JOIN exclusive_pilots ep ON cd.cardId = ep.cardId
     LEFT JOIN card_set_inclusion si ON cd.cardId = si.cardId
     WHERE cd.cardId IN (${placeholders})
     ORDER BY cd.cardId, ct.altFlag, ct.branch
@@ -613,6 +729,7 @@ pool.query(idQuery, idQueryParams, (err, idResults) => {
       FROM traits1
       WHERE cardId IN (${cardIds.map(() => '?').join(',')})
     `;
+
     pool.query(t1Query, cardIds, (err, t1Results) => {
       if (err) {
         console.error('traits1データ取得エラー:', err);
@@ -623,17 +740,28 @@ pool.query(idQuery, idQueryParams, (err, idResults) => {
       t1Results.forEach(row => {
         t1Map[row.cardId] = convertT1RowToTraits(row);
       });
+      
+
+
 
       // 3. メイン結果をグループ化・整形
       const formatted = formatCardResults(mainResults);
       // traits2 のデータを事前に抽出
       const t2Map = extractTraits2(mainResults);
+      // traits2 のデータを事前に抽出
+      const epMap = extractexClusivePilots(mainResults);
+      // traits2 のデータを事前に抽出
+      const caMap = extractAliases(mainResults);
 
       // traits1 + traits2 を結合してマージ
       formatted.forEach(card => {
         const t1 = t1Map[card.cardId] || [];
         const t2 = t2Map[card.cardId] ? Array.from(t2Map[card.cardId]) : [];
+        const ep = epMap[card.cardId] || [];
+        const ca = caMap[card.cardId] || [];
         card.traits = [...t1, ...t2];
+        card.aliases = ca.join(', ');
+        card.exclusivePilots = ep.join(', ');
       });
 
       // 4. count クエリ実行
